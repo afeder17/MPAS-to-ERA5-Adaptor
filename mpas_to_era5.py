@@ -1,78 +1,25 @@
 """
-MPAS to ERA5 Converter - CONSERVATIVE REGRIDDING VERSION
+MPAS to ERA5 Converter - 1-DEGREE BILINEAR WINDS VERSION
 
 Written by Andrew Feder and Claude AI
 
-Optimized with Numba-accelerated vertical interpolation.
+Bilinear interpolation for u, v, q fields to preserve spatial coherence.
+Nearest-neighbor for P, E, SP (local quantities).
+Numba-accelerated vertical interpolation.
 
-Usage
------
-    python mpas_to_era5.py <input_dir> <output_dir> [options]
-
-Arguments
----------
-    input_dir       Directory containing MPAS *.h1a.*.nc files
-    output_dir      Directory for ERA5-formatted output (created if needed)
-
-Options
--------
-    --time-shift HOURS      Shift timestamps by HOURS (float, default: 0)
-    --start-year YEAR       First year to process (default: 1)
-    --end-year YEAR         Last year to process (default: 9999)
-    --start-month MONTH     First month to process (default: 1)
-    --end-month MONTH       Last month to process (default: 12)
-    --cores N               Total CPU cores to use (default: all available).
-                            Auto-splits between file-parallel workers and
-                            Numba threads for vertical interpolation.
-
-Examples
---------
-    # Process all files
-    python mpas_to_era5.py /glade/derecho/scratch/.../mpas_out ./era5_out
-
-    # Process years 50-100, shift timestamps by -12 hours, use 64 cores
-    python mpas_to_era5.py /glade/derecho/scratch/.../mpas_out ./era5_out \
-        --start-year 50 --end-year 100 --time-shift -12 --cores 64
-
-    # Process only JJA (June-August) from year 80 onward
-    python mpas_to_era5.py /glade/derecho/scratch/.../mpas_out ./era5_out \
-        --start-year 80 --start-month 6 --end-month 8
-
-    # Process a single month (e.g., January year 90)
-    python mpas_to_era5.py /glade/derecho/scratch/.../mpas_out ./era5_out \
-        --start-year 90 --end-year 90 --start-month 1 --end-month 1
-
-Output Structure
-----------------
-    output_dir/
-        conservative_mapping.npy          # Reusable MPAS-to-grid mapping
-        YYYY/MM/
-            ERA5_YYYY-MM-DD_ml_u.nc       # U-wind on model levels
-            ERA5_YYYY-MM-DD_ml_v.nc       # V-wind on model levels
-            ERA5_YYYY-MM-DD_ml_q.nc       # Specific humidity on model levels
-            ERA5_YYYY-MM-DD_sp.nc         # Surface pressure
-            ERA5_YYYY-MM-DD_tcw.nc        # Total column water
-            ERA5_YYYY-MM-DD_e.nc          # Evaporation (if LHFLX available)
-            ERA5_YYYY-MM-DD_tp.nc         # Precipitation (if PRECT available)
-
-Notes
------
-    - Output uses 22 ERA5 hybrid model levels (level 20-137), 0.25° grid,
-      descending latitude (90 to -90), and 0-360° longitude.
-    - Vertical interpolation is performed in log-pressure space.
-    - Horizontal regridding uses nearest-cell (not area-weighted) mapping.
-    - Time encoding uses noleap calendar for compatibility with CESM output.
-    - Month filtering requires start_month <= end_month (no wrap-around).
-      For DJF, run December and Jan-Feb as separate invocations.
-    - For Derecho PBS jobs, set --cores to match your allocation (e.g., 128).
+Example for new PI run:
+    python mpas_to_era5_1deg.py \
+        /glade/derecho/scratch/dazlich/feder_amip1850.120km.npe512/run/cam.h1a \
+        /glade/derecho/scratch/afeder/era5_1deg_newpi \
+        --time-shift -1.5 --start-year 1 --end-year 2 --end-month 3 --cores 64
 """
 
 import os
-os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'  # fork-safe threading backend
+os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'
 
 import numpy as np
 import xarray as xr
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Delaunay
 import argparse
 from pathlib import Path
 from multiprocessing import Pool
@@ -80,6 +27,7 @@ import warnings
 from datetime import timedelta
 import time as time_module
 from numba import njit, prange
+import pickle
 
 warnings.filterwarnings('ignore')
 
@@ -90,12 +38,13 @@ A_COEFF = np.array([316.420746, 2900.391357, 10065.978516, 19620.042969, 20087.0
 
 B_COEFF = np.array([0.000000, 0.000000, 0.000340, 0.068448, 0.203491, 0.308598, 0.438391, 0.576692, 0.704669, 0.809536, 0.887408, 0.922096, 0.940860, 0.963352, 0.975078, 0.980072, 0.984542, 0.988500, 0.991984, 0.995003, 0.997630, 1.000000])
 
-# DESCENDING latitude, 0-360 longitude for WAM2layers
-LAT_025 = np.arange(90, -90.25, -0.25)
-LON_025 = np.arange(0, 360, 0.25)
+# 1-DEGREE grid, DESCENDING latitude, 0-360 longitude
+LAT_025 = np.arange(90, -90.1, -1.0)
+LON_025 = np.arange(0, 360, 1.0)
 
 # Globals for workers
-WORKER_MAPPING = None
+WORKER_NN_MAPPING = None
+WORKER_BILINEAR = None
 WORKER_TIME_SHIFT = 0
 WORKER_OUTPUT_DIR = None
 
@@ -105,19 +54,6 @@ WORKER_OUTPUT_DIR = None
 # ---------------------------------------------------------------------------
 @njit(parallel=True, cache=True)
 def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
-    """
-    Vectorized vertical interpolation in log-pressure space using Numba.
-
-    Parameters
-    ----------
-    data_3d  : (nlev_src, nlat, nlon) float32 - source data on MPAS levels
-    p_src_3d : (nlev_src, nlat, nlon) float32 - pressure on MPAS levels
-    p_tgt_3d : (nlev_tgt, nlat, nlon) float32 - pressure on ERA5 levels
-
-    Returns
-    -------
-    out : (nlev_tgt, nlat, nlon) float32
-    """
     nlev_src = data_3d.shape[0]
     nlev_tgt = p_tgt_3d.shape[0]
     nlat = data_3d.shape[1]
@@ -125,13 +61,11 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
     out = np.empty((nlev_tgt, nlat, nlon), dtype=np.float32)
 
     for ilat in prange(nlat):
-        # Scratch arrays allocated per-row to avoid contention
         p_valid = np.empty(nlev_src, dtype=np.float64)
         d_valid = np.empty(nlev_src, dtype=np.float64)
         idx     = np.empty(nlev_src, dtype=np.int64)
 
         for ilon in range(nlon):
-            # ---- gather valid source levels ----
             n_valid = 0
             for i in range(nlev_src):
                 ps = p_src_3d[i, ilat, ilon]
@@ -146,7 +80,6 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
                     out[k, ilat, ilon] = np.nan
                 continue
 
-            # ---- sort by log-pressure (insertion sort, small n) ----
             for i in range(n_valid):
                 idx[i] = i
             for i in range(1, n_valid):
@@ -158,11 +91,9 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
                     j -= 1
                 idx[j + 1] = key_i
 
-            # ---- interpolate each target level ----
             for k in range(nlev_tgt):
                 lp = np.log(np.float64(p_tgt_3d[k, ilat, ilon]))
 
-                # Below lowest source level -> extrapolate from first segment
                 if lp <= p_valid[idx[0]]:
                     if n_valid >= 2:
                         p0 = p_valid[idx[0]]; p1 = p_valid[idx[1]]
@@ -173,8 +104,6 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
                             out[k, ilat, ilon] = np.float32(d0)
                     else:
                         out[k, ilat, ilon] = np.float32(d_valid[idx[0]])
-
-                # Above highest source level -> extrapolate from last segment
                 elif lp >= p_valid[idx[n_valid - 1]]:
                     if n_valid >= 2:
                         p0 = p_valid[idx[n_valid - 2]]; p1 = p_valid[idx[n_valid - 1]]
@@ -185,8 +114,6 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
                             out[k, ilat, ilon] = np.float32(d1)
                     else:
                         out[k, ilat, ilon] = np.float32(d_valid[idx[n_valid - 1]])
-
-                # Interior -> linear interpolation
                 else:
                     for m in range(n_valid - 1):
                         if p_valid[idx[m]] <= lp <= p_valid[idx[m + 1]]:
@@ -199,7 +126,6 @@ def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
 
 
 def _warm_up_jit():
-    """Trigger JIT compilation at import time so workers don't all compile."""
     dummy = np.ones((3, 4, 4), dtype=np.float32)
     p_src = np.array([1000, 800, 500], dtype=np.float32)[:, None, None] * np.ones((1, 4, 4), dtype=np.float32)
     p_tgt = np.array([900, 600], dtype=np.float32)[:, None, None] * np.ones((1, 4, 4), dtype=np.float32)
@@ -207,23 +133,80 @@ def _warm_up_jit():
 
 
 # ---------------------------------------------------------------------------
+# Bilinear interpolation
+# ---------------------------------------------------------------------------
+def build_bilinear_mapping(lat_mpas, lon_mpas):
+    """Build Delaunay triangulation for bilinear interpolation of u/v/q."""
+    print("  Building bilinear (Delaunay) mapping...")
 
-
-def init_worker(mapping_path, time_shift, output_dir):
-    global WORKER_MAPPING, WORKER_TIME_SHIFT, WORKER_OUTPUT_DIR
-    WORKER_MAPPING = np.load(mapping_path)
-    WORKER_TIME_SHIFT = time_shift
-    WORKER_OUTPUT_DIR = output_dir
-
-
-def build_conservative_mapping(lat_mpas, lon_mpas):
-    """Build nearest-cell mapping from MPAS to target grid."""
-    print("  Building conservative (nearest-cell) mapping...")
-
-    # Convert MPAS lon to 0-360 if needed
     lon_mpas_360 = np.where(lon_mpas < 0, lon_mpas + 360, lon_mpas)
 
-    # Cartesian coords for spherical distance
+    # Replicate near boundaries for periodicity
+    near_0 = lon_mpas_360 < 10
+    near_360 = lon_mpas_360 > 350
+
+    lat_ext = np.concatenate([lat_mpas, lat_mpas[near_0], lat_mpas[near_360]])
+    lon_ext = np.concatenate([lon_mpas_360, lon_mpas_360[near_0] + 360, lon_mpas_360[near_360] - 360])
+    idx_ext = np.concatenate([np.arange(len(lat_mpas)), np.where(near_0)[0], np.where(near_360)[0]])
+
+    points = np.column_stack([lat_ext, lon_ext])
+
+    lon_2d, lat_2d = np.meshgrid(LON_025, LAT_025)
+    target_points = np.column_stack([lat_2d.ravel(), lon_2d.ravel()])
+
+    tri = Delaunay(points)
+    simplex_idx = tri.find_simplex(target_points)
+    outside = simplex_idx < 0
+    print(f"    Points outside triangulation: {outside.sum()} / {len(target_points)} ({outside.sum()/len(target_points)*100:.1f}%)")
+
+    # Precompute barycentric weights for inside points
+    inside_mask = ~outside
+    simplices = tri.simplices[simplex_idx[inside_mask]]
+    transforms = tri.transform[simplex_idx[inside_mask]]
+    delta = target_points[inside_mask] - transforms[:, 2, :]
+    bary = np.einsum('ijk,ik->ij', transforms[:, :2, :], delta)
+    bary_weights = np.column_stack([bary, 1 - bary.sum(axis=1)]).astype(np.float32)
+    vertex_mpas_idx = idx_ext[simplices]
+
+    # Nearest-neighbor fallback for outside points
+    tree = cKDTree(points)
+    nn_mpas_idx = np.zeros(outside.sum(), dtype=np.int64)
+    if outside.sum() > 0:
+        _, nn_idx = tree.query(target_points[outside])
+        nn_mpas_idx = idx_ext[nn_idx]
+
+    info = {
+        'inside_mask': inside_mask,
+        'vertex_mpas_idx': vertex_mpas_idx,
+        'bary_weights': bary_weights,
+        'nn_mpas_idx': nn_mpas_idx,
+        'shape': (len(LAT_025), len(LON_025)),
+        'n_target': len(target_points),
+    }
+    print(f"    Bilinear mapping: {len(LAT_025)} x {len(LON_025)} grid")
+    return info
+
+
+def bilinear_regrid(data_1d, info):
+    """Fast bilinear regrid using precomputed weights."""
+    result = np.zeros(info['n_target'], dtype=np.float32)
+    inside = info['inside_mask']
+    result[inside] = (data_1d[info['vertex_mpas_idx']] * info['bary_weights']).sum(axis=1)
+    outside = ~inside
+    if outside.sum() > 0:
+        result[outside] = data_1d[info['nn_mpas_idx']]
+    return result.reshape(info['shape'])
+
+
+# ---------------------------------------------------------------------------
+# Nearest-neighbor mapping (for P, E, SP)
+# ---------------------------------------------------------------------------
+def build_nearest_mapping(lat_mpas, lon_mpas):
+    """Build nearest-cell mapping from MPAS to target grid."""
+    print("  Building nearest-neighbor mapping...")
+
+    lon_mpas_360 = np.where(lon_mpas < 0, lon_mpas + 360, lon_mpas)
+
     mpas_x = np.cos(np.radians(lat_mpas)) * np.cos(np.radians(lon_mpas_360))
     mpas_y = np.cos(np.radians(lat_mpas)) * np.sin(np.radians(lon_mpas_360))
     mpas_z = np.sin(np.radians(lat_mpas))
@@ -238,17 +221,18 @@ def build_conservative_mapping(lat_mpas, lon_mpas):
     tgt_xyz = np.column_stack([tgt_x.ravel(), tgt_y.ravel(), tgt_z.ravel()])
     _, indices = tree.query(tgt_xyz)
 
-    print(f"    Mapping: {len(LAT_025)} × {len(LON_025)} → {len(lat_mpas)} MPAS cells")
+    print(f"    Mapping: {len(LAT_025)} x {len(LON_025)} -> {len(lat_mpas)} MPAS cells")
     return indices.reshape(lat_2d.shape)
 
 
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 def calc_pressure(ps, a, b):
-    """Calculate pressure on ERA5 hybrid levels (vectorized)."""
     return a[:, None, None] + b[:, None, None] * ps[None, :, :]
 
 
 def compute_tcw(q_3d, p_3d, ps_2d):
-    """Total column water."""
     g = 9.81
     tcw = np.zeros_like(ps_2d)
     for k in range(q_3d.shape[0] - 1):
@@ -282,7 +266,7 @@ def save_model_level_var(data_4d, var_name, times, output_path, long_name, units
                 'model_level': create_level_coord(),
                 'latitude': create_latitude_coord(),
                 'longitude': create_longitude_coord()},
-        attrs={'Conventions': 'CF-1.6', 'source': 'MPAS-CAM converted to ERA5 format (conservative regridding)'}
+        attrs={'Conventions': 'CF-1.6', 'source': 'MPAS-CAM converted to ERA5 format (1-deg bilinear winds)'}
     )
     ds.to_netcdf(output_path, encoding={
         'valid_time': {'units': 'seconds since 1970-01-01', 'calendar': 'noleap'},
@@ -299,7 +283,7 @@ def save_surface_var(data_3d, var_name, times, output_path, long_name, units, st
         coords={'valid_time': xr.DataArray(times, dims=['valid_time']),
                 'latitude': create_latitude_coord(),
                 'longitude': create_longitude_coord()},
-        attrs={'Conventions': 'CF-1.6', 'source': 'MPAS-CAM converted to ERA5 format (conservative regridding)'}
+        attrs={'Conventions': 'CF-1.6', 'source': 'MPAS-CAM converted to ERA5 format (1-deg bilinear winds)'}
     )
     ds.to_netcdf(output_path, encoding={
         'valid_time': {'units': 'seconds since 1970-01-01', 'calendar': 'noleap'},
@@ -307,18 +291,28 @@ def save_surface_var(data_3d, var_name, times, output_path, long_name, units, st
     ds.close()
 
 
+# ---------------------------------------------------------------------------
+# Worker functions
+# ---------------------------------------------------------------------------
+def init_worker(nn_mapping_path, bilinear_path, time_shift, output_dir):
+    global WORKER_NN_MAPPING, WORKER_BILINEAR, WORKER_TIME_SHIFT, WORKER_OUTPUT_DIR
+    WORKER_NN_MAPPING = np.load(nn_mapping_path)
+    with open(bilinear_path, 'rb') as f:
+        WORKER_BILINEAR = pickle.load(f)
+    WORKER_TIME_SHIFT = time_shift
+    WORKER_OUTPUT_DIR = output_dir
+
+
 def process_file(mpas_file):
-    global WORKER_MAPPING, WORKER_TIME_SHIFT, WORKER_OUTPUT_DIR
+    global WORKER_NN_MAPPING, WORKER_BILINEAR, WORKER_TIME_SHIFT, WORKER_OUTPUT_DIR
 
     filename = Path(mpas_file).name
-    print(f"  Starting: {filename}", flush=True)
     file_start = time_module.time()
 
     try:
         ds = xr.open_dataset(mpas_file)
 
         q = ds.Q.values
-        t = ds.T.values
         u = ds.U.values
         v = ds.V.values
         ps = ds.PS.values
@@ -326,26 +320,21 @@ def process_file(mpas_file):
         pmid = ds.PMID.values if use_pmid else None
         time_vals = ds.time.values
 
-        lat_mpas = ds['lat'].values if 'lat' in ds else ds.coords['lat'].values
-        lon_mpas = ds['lon'].values if 'lon' in ds else ds.coords['lon'].values
-
         nlev_mpas = q.shape[1]
         nlat, nlon = len(LAT_025), len(LON_025)
+        nn_flat = WORKER_NN_MAPPING.ravel()
 
         tp = e = None
         if 'PRECT' in ds.data_vars:
             tp = ds.PRECT.values * 3600.0
+        elif 'PRECC' in ds.data_vars and 'PRECL' in ds.data_vars:
+            tp = (ds.PRECC.values + ds.PRECL.values) * 3600.0
         if 'LHFLX' in ds.data_vars:
             e = -ds.LHFLX.values * 3600.0 / (1000.0 * 2.5e6)
 
         ds.close()
 
-        # Flatten mapping for vectorized indexing
-        mapping_flat = WORKER_MAPPING.ravel()
-
-        # Use ALL timesteps
-        timestep_indices = list(range(len(time_vals)))
-        n_timesteps = len(timestep_indices)
+        n_timesteps = len(time_vals)
 
         u_daily = np.zeros((n_timesteps, len(ERA5_LEVELS), nlat, nlon), dtype=np.float32)
         v_daily = np.zeros_like(u_daily)
@@ -356,48 +345,52 @@ def process_file(mpas_file):
         tp_daily = np.zeros_like(sp_daily) if tp is not None else None
         times_daily = []
 
-        for idx, it in enumerate(timestep_indices):
-            time_val = time_vals[it]
+        for idx in range(n_timesteps):
+            time_val = time_vals[idx]
 
             if WORKER_TIME_SHIFT != 0:
                 time_val = time_val + timedelta(hours=WORKER_TIME_SHIFT)
 
             times_daily.append(time_val)
 
-            # Vectorized horizontal regrid: index all levels at once
-            q_h = q[it][:, mapping_flat].reshape(nlev_mpas, nlat, nlon).astype(np.float32)
-            u_h = u[it][:, mapping_flat].reshape(nlev_mpas, nlat, nlon).astype(np.float32)
-            v_h = v[it][:, mapping_flat].reshape(nlev_mpas, nlat, nlon).astype(np.float32)
+            # BILINEAR for u, v, q (each level separately)
+            q_h = np.zeros((nlev_mpas, nlat, nlon), dtype=np.float32)
+            u_h = np.zeros_like(q_h)
+            v_h = np.zeros_like(q_h)
 
-            ps_h = ps[it][mapping_flat].reshape(nlat, nlon).astype(np.float32)
+            for k in range(nlev_mpas):
+                q_h[k] = bilinear_regrid(q[idx, k].astype(np.float32), WORKER_BILINEAR)
+                u_h[k] = bilinear_regrid(u[idx, k].astype(np.float32), WORKER_BILINEAR)
+                v_h[k] = bilinear_regrid(v[idx, k].astype(np.float32), WORKER_BILINEAR)
 
-            # Pressure on MPAS levels
+            # NEAREST for surface pressure
+            ps_h = ps[idx][nn_flat].reshape(nlat, nlon).astype(np.float32)
+
+            # Pressure on MPAS levels (nearest, tied to SP)
             if use_pmid:
-                p_mpas = pmid[it][:, mapping_flat].reshape(nlev_mpas, nlat, nlon).astype(np.float32)
+                p_mpas = pmid[idx][:, nn_flat].reshape(nlev_mpas, nlat, nlon).astype(np.float32)
             else:
                 sigma = np.linspace(1.0, 0.0, nlev_mpas).astype(np.float32)
                 p_mpas = sigma[:, None, None] * ps_h[None, :, :]
 
-            # Pressure on ERA5 levels
             p_era5 = calc_pressure(ps_h, A_COEFF, B_COEFF).astype(np.float32)
 
-            # Numba-accelerated vertical interpolation
             q_v = vert_interp_batch(q_h, p_mpas, p_era5)
             u_v = vert_interp_batch(u_h, p_mpas, p_era5)
             v_v = vert_interp_batch(v_h, p_mpas, p_era5)
 
             u_daily[idx] = u_v
             v_daily[idx] = v_v
-            q_daily[idx] = q_v
+            q_daily[idx] = np.maximum(q_v, 0)
             sp_daily[idx] = ps_h
             tcw_daily[idx] = compute_tcw(q_v, p_era5, ps_h)
 
+            # NEAREST for P and E
             if e is not None:
-                e_daily[idx] = e[it][mapping_flat].reshape(nlat, nlon).astype(np.float32)
+                e_daily[idx] = e[idx][nn_flat].reshape(nlat, nlon).astype(np.float32)
             if tp is not None:
-                tp_daily[idx] = tp[it][mapping_flat].reshape(nlat, nlon).astype(np.float32)
+                tp_daily[idx] = tp[idx][nn_flat].reshape(nlat, nlon).astype(np.float32)
 
-        # Get date from first timestamp (cftime object)
         t0 = times_daily[0]
         date_str = f"{t0.year:04d}-{t0.month:02d}-{t0.day:02d}"
         month_dir = os.path.join(WORKER_OUTPUT_DIR, f"{t0.year:04d}", f"{t0.month:02d}")
@@ -436,7 +429,7 @@ def process_file(mpas_file):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert MPAS to ERA5 format (conservative regridding)')
+    parser = argparse.ArgumentParser(description='Convert MPAS to ERA5 format (1-deg bilinear winds)')
     parser.add_argument('input_dir')
     parser.add_argument('output_dir')
     parser.add_argument('--time-shift', type=float, default=0)
@@ -444,55 +437,47 @@ def main():
     parser.add_argument('--end-year', type=int, default=9999)
     parser.add_argument('--start-month', type=int, default=1)
     parser.add_argument('--end-month', type=int, default=12)
-    parser.add_argument('--cores', type=int, default=None,
-                        help='Total cores available. Auto-splits between file-parallel workers '
-                             'and Numba threads. Default: all available cores.')
+    parser.add_argument('--cores', type=int, default=None)
 
     args = parser.parse_args()
 
-    # Auto-tune worker/thread split
     import numba
     total_cores = args.cores or os.cpu_count()
-    # Heuristic: give Numba ~8-16 threads (diminishing returns beyond that for
-    # the lat-parallel interp), use remaining cores for file-level parallelism.
-    # Minimum 1 worker, minimum 4 Numba threads.
     numba_threads = min(max(4, total_cores // 8), 16)
     n_workers = max(1, total_cores // numba_threads)
-    # Set Numba thread count before JIT warm-up
     numba.set_num_threads(numba_threads)
 
     print("="*70)
-    print("MPAS TO ERA5 CONVERTER - CONSERVATIVE REGRIDDING (NUMBA)")
+    print("MPAS TO ERA5 CONVERTER - 1-DEG BILINEAR WINDS (NUMBA)")
     print("="*70)
     print(f"  Input:      {args.input_dir}")
     print(f"  Output:     {args.output_dir}")
+    print(f"  Grid:       {len(LAT_025)} x {len(LON_025)} (1-degree)")
     print(f"  Time shift: {args.time_shift} hours")
     print(f"  Years:      {args.start_year} - {args.end_year}")
     print(f"  Months:     {args.start_month} - {args.end_month}")
     print(f"  Total cores: {total_cores}")
-    print(f"  Workers:    {n_workers}  (file-level parallelism)")
-    print(f"  Numba thds: {numba_threads}  (per-worker vert. interp)")
+    print(f"  Workers:    {n_workers}")
+    print(f"  Numba thds: {numba_threads}")
 
-    # Warm up JIT before forking workers
     print("\nWarming up Numba JIT...")
     _warm_up_jit()
-    print("  JIT ready ✓")
+    print("  JIT ready")
 
     # Find files
     all_files = sorted(Path(args.input_dir).glob("*.h1a.*.nc"))
-    print(f"\nFound {len(all_files)} total files (*.h1a.*.nc)")
+    print(f"\nFound {len(all_files)} total files")
 
     mpas_files = []
     for f in all_files:
         try:
-            name_parts = f.stem.split('.')
-            date_part = name_parts[-1]
+            date_part = f.stem.split('.h1a.')[-1]
             date_str = date_part.rsplit('-', 1)[0]
             year, month, day = map(int, date_str.split('-'))
 
             if args.start_year <= year <= args.end_year and args.start_month <= month <= args.end_month:
                 mpas_files.append(str(f))
-        except Exception as e:
+        except:
             pass
 
     print(f"Filtered to {len(mpas_files)} files")
@@ -503,18 +488,23 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Build mapping
-    print("\nBuilding conservative mapping...")
+    # Build mappings
+    print("\nLoading MPAS grid...")
     ds0 = xr.open_dataset(mpas_files[0])
     lat_mpas = ds0['lat'].values if 'lat' in ds0 else ds0.coords['lat'].values
     lon_mpas = ds0['lon'].values if 'lon' in ds0 else ds0.coords['lon'].values
     ds0.close()
 
-    mapping = build_conservative_mapping(lat_mpas, lon_mpas)
-    mapping_path = os.path.join(args.output_dir, 'conservative_mapping.npy')
-    np.save(mapping_path, mapping)
-    print(f"  Saved: {mapping_path}")
-    del mapping
+    nn_mapping = build_nearest_mapping(lat_mpas, lon_mpas)
+    nn_path = os.path.join(args.output_dir, 'nearest_mapping.npy')
+    np.save(nn_path, nn_mapping)
+    del nn_mapping
+
+    bilinear_info = build_bilinear_mapping(lat_mpas, lon_mpas)
+    bl_path = os.path.join(args.output_dir, 'bilinear_info.pkl')
+    with open(bl_path, 'wb') as f:
+        pickle.dump(bilinear_info, f)
+    del bilinear_info
 
     # Process
     print(f"\nProcessing {len(mpas_files)} files with {n_workers} workers...")
@@ -524,7 +514,7 @@ def main():
     completed = failed = 0
 
     with Pool(n_workers, initializer=init_worker,
-              initargs=(mapping_path, args.time_shift, args.output_dir)) as pool:
+              initargs=(nn_path, bl_path, args.time_shift, args.output_dir)) as pool:
         for result in pool.imap_unordered(process_file, mpas_files):
             if result.startswith('✓'):
                 completed += 1
@@ -532,7 +522,7 @@ def main():
                 failed += 1
 
             total = completed + failed
-            if total % 100 == 0:
+            if total % 50 == 0:
                 elapsed = time_module.time() - start_time
                 rate = total / elapsed if elapsed > 0 else 0
                 eta = (len(mpas_files) - total) / rate if rate > 0 else 0

@@ -21,6 +21,7 @@ import numpy as np
 import xarray as xr
 from scipy.spatial import cKDTree, Delaunay
 import argparse
+ACCUM_SECONDS_DEFAULT = 10800.0  # fallback if the time axis has a single step
 from pathlib import Path
 from multiprocessing import Pool
 import warnings
@@ -53,6 +54,34 @@ WORKER_OUTPUT_DIR = None
 # Numba-accelerated vertical interpolation
 # ---------------------------------------------------------------------------
 @njit(parallel=True, cache=True)
+
+def _accum_seconds(ds, fallback):
+    """Accumulation interval of the input stream in seconds, from the file's time axis.
+
+    ERA5 'tp' and 'e' are accumulations over the data interval (metres of water per
+    step). MPAS PRECT and LHFLX are instantaneous rates, so they must be multiplied
+    by the interval length. Earlier versions hard-coded 3600 s (hourly), which is a
+    factor 3 too small for 3-hourly MPAS output.
+    """
+    try:
+        tv = ds["time"].values
+        if len(tv) > 1:
+            d = tv[1] - tv[0]
+            if isinstance(d, np.timedelta64):
+                return float(d / np.timedelta64(1, "s"))
+            if hasattr(d, "total_seconds"):
+                return float(d.total_seconds())
+            # numeric time axis (decode_times=False): scale by the units attribute
+            units = str(ds["time"].attrs.get("units", "")).lower()
+            per = {"day": 86400.0, "hour": 3600.0, "minute": 60.0, "second": 1.0}
+            for k, v in per.items():
+                if units.startswith(k):
+                    return float(d) * v
+    except Exception:
+        pass
+    return float(fallback)
+
+
 def vert_interp_batch(data_3d, p_src_3d, p_tgt_3d):
     nlev_src = data_3d.shape[0]
     nlev_tgt = p_tgt_3d.shape[0]
@@ -325,12 +354,13 @@ def process_file(mpas_file):
         nn_flat = WORKER_NN_MAPPING.ravel()
 
         tp = e = None
+        accum_s = _accum_seconds(ds, ACCUM_SECONDS_DEFAULT)
         if 'PRECT' in ds.data_vars:
-            tp = ds.PRECT.values * 3600.0
+            tp = ds.PRECT.values * accum_s
         elif 'PRECC' in ds.data_vars and 'PRECL' in ds.data_vars:
-            tp = (ds.PRECC.values + ds.PRECL.values) * 3600.0
+            tp = (ds.PRECC.values + ds.PRECL.values) * accum_s
         if 'LHFLX' in ds.data_vars:
-            e = -ds.LHFLX.values * 3600.0 / (1000.0 * 2.5e6)
+            e = -ds.LHFLX.values * accum_s / (1000.0 * 2.5e6)
 
         ds.close()
 
